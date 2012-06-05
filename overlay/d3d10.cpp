@@ -104,8 +104,8 @@ class D10State: protected Pipe {
 		void newTexture(unsigned int w, unsigned int h);
 };
 
-map<IDXGISwapChain *, D10State *> chains;
-map<ID3D10Device *, D10State *> devices;
+static map<IDXGISwapChain *, D10State *> chains;
+static map<ID3D10Device *, D10State *> devices;
 
 D10State::D10State(IDXGISwapChain *pSwapChain, ID3D10Device *pDevice) {
 	this->pSwapChain = pSwapChain;
@@ -451,7 +451,7 @@ static HRESULT __stdcall myPresent(IDXGISwapChain *pSwapChain, UINT SyncInterval
 			ds = NULL;
 		}
 		if (! ds) {
-			ods("DXGI: New state");
+			ods("DXGI: New state for device %p", pDevice);
 			ds = new D10State(pSwapChain, pDevice);
 			chains[pSwapChain] = ds;
 			devices[pDevice] = ds;
@@ -494,10 +494,11 @@ static ULONG __stdcall myAddRef(ID3D10Device *pDevice) {
 	LONG res = oAddRef(pDevice);
 	hhAddRef.inject();
 
-	Mutex m;
 	D10State *ds = devices[pDevice];
-	if (ds)
+	if (ds) {
+		ods("D3D10: HighMark %d->%d", ds->lHighMark, res);
 		ds->lHighMark = res;
+	}
 
 	return res;
 }
@@ -509,7 +510,6 @@ static ULONG __stdcall myRelease(ID3D10Device *pDevice) {
 	LONG res = oRelease(pDevice);
 	hhRelease.inject();
 
-	Mutex m;
 	D10State *ds = devices[pDevice];
 	if (ds)
 		if (res < (ds->lHighMark / 2)) {
@@ -519,23 +519,26 @@ static ULONG __stdcall myRelease(ID3D10Device *pDevice) {
 			delete ds;
 			ods("D3D10: Deleted");
 			ds = NULL;
+		} else {
+			ods("D3D10: Keeping resources %d > .5 %d", res, ds->lHighMark);
 		}
 
 	return res;
 }
 
 static void HookAddRelease(voidFunc vfAdd, voidFunc vfRelease) {
-	ods("D3D10: Injecting device add/remove");
+	ods("D3D10: Injecting device AddRef/Release");
 	hhAddRef.setup(vfAdd, reinterpret_cast<voidFunc>(myAddRef));
 	hhRelease.setup(vfRelease, reinterpret_cast<voidFunc>(myRelease));
 }
 
 static void HookPresentRaw(voidFunc vfPresent) {
+	ods("D3D10: Injecting device Present");
 	hhPresent.setup(vfPresent, reinterpret_cast<voidFunc>(myPresent));
 }
 
 static void HookResizeRaw(voidFunc vfResize) {
-	ods("DXGI: Injecting ResizeBuffers Raw");
+	ods("D3D10: Injecting ResizeBuffers Raw");
 	hhResize.setup(vfResize, reinterpret_cast<voidFunc>(myResize));
 }
 
@@ -570,10 +573,14 @@ void checkDXGIHook(bool preonly) {
 				HookPresentRaw((voidFunc)(raw + dxgi->iOffsetPresent));
 				HookResizeRaw((voidFunc)(raw + dxgi->iOffsetResize));
 
-				GetModuleFileNameW(hD3D10, procname, 2048);
-				if (_wcsicmp(dxgi->wcD3D10FileName, procname) == 0) {
-					unsigned char *raw = (unsigned char *) hD3D10;
-					HookAddRelease((voidFunc)(raw + dxgi->iOffsetAddRef), (voidFunc)(raw + dxgi->iOffsetRelease));
+				if (dxgi->iOffsetAddRef && dxgi->iOffsetRelease) {
+					GetModuleFileNameW(hD3D10, procname, 2048);
+					if (_wcsicmp(dxgi->wcD3D10FileName, procname) == 0) {
+						unsigned char *raw = (unsigned char *) hD3D10;
+						HookAddRelease((voidFunc)(raw + dxgi->iOffsetAddRef), (voidFunc)(raw + dxgi->iOffsetRelease));
+					}
+				} else {
+                    fods("DXGI: Can't hook AddRef/Release");
 				}
 			} else if (! preonly) {
 				fods("DXGI Interface changed, can't rawpatch");
@@ -690,6 +697,8 @@ extern "C" __declspec(dllexport) void __cdecl PrepareDXGI() {
 								unsigned char *a = (unsigned char *) hRef;
 								dxgi->iOffsetResize = b-a;
 								ods("DXGI: Successfully found ResizeBuffers offset: %ls: %d", dxgi->wcDXGIFileName, dxgi->iOffsetResize);
+							} else {
+								ods("DXGI: Failed to find offset for ResizeBuffers: %s != %s", buff, dxgi->wcDXGIFileName);
 							}
 						}
 
@@ -717,6 +726,8 @@ extern "C" __declspec(dllexport) void __cdecl PrepareDXGI() {
 								unsigned char *a = (unsigned char *) hRef;
 								dxgi->iOffsetRelease = b-a;
 								ods("D3D10: Successfully found Release offset: %ls: %d", dxgi->wcD3D10FileName, dxgi->iOffsetRelease);
+							} else {
+								ods("D3D10: Failed to find offset for Release: %s != %s", buff, dxgi->wcD3D10FileName);
 							}
 						}
 					}

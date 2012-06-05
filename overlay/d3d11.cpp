@@ -103,8 +103,8 @@ class D11State: protected Pipe {
 		void newTexture(unsigned int w, unsigned int h);
 };
 
-map<IDXGISwapChain *, D11State *> chains;
-map<ID3D11Device *, D11State *> devices;
+static map<IDXGISwapChain *, D11State *> chains;
+static map<ID3D11Device *, D11State *> devices;
 
 D11State::D11State(IDXGISwapChain *pSwapChain, ID3D11Device *pDevice) {
 	this->pSwapChain = pSwapChain;
@@ -134,6 +134,7 @@ D11State::D11State(IDXGISwapChain *pSwapChain, ID3D11Device *pDevice) {
 
 	pDevice->AddRef();
 	initRefCount = pDevice->Release();
+	ods("D3D11: constructor addref/release pDevice %p ref=%d", pDevice, initRefCount);
 }
 
 void D11State::blit(unsigned int x, unsigned int y, unsigned int w, unsigned int h) {
@@ -309,6 +310,8 @@ void D11State::init() {
 	} else {
 		bDeferredContext=true;
 	}
+
+	ods("D3D11: pDevice=%p pSwapChain=%p pDeviceContext=%p", pDevice, pSwapChain, pDeviceContext);
 
 	D3D11_TEXTURE2D_DESC backBufferSurfaceDesc;
 	pBackBuffer->GetDesc(&backBufferSurfaceDesc);
@@ -493,7 +496,6 @@ void D11State::draw() {
 }
 
 
-
 static HRESULT __stdcall myPresent(IDXGISwapChain *pSwapChain, UINT SyncInterval, UINT Flags) {
 	HRESULT hr;
 
@@ -503,6 +505,7 @@ static HRESULT __stdcall myPresent(IDXGISwapChain *pSwapChain, UINT SyncInterval
 
 	hr = pSwapChain->GetDevice(__uuidof(ID3D11Device), (void **) &pDevice);
 	if (pDevice) {
+		ods("DXGI11: pDevice=%p pSwapChain=%p", pDevice, pSwapChain);
 		D11State *ds = chains[pSwapChain];
 		if (ds && ds->pDevice != pDevice) {
 			ods("DXGI11: SwapChain device changed");
@@ -511,7 +514,7 @@ static HRESULT __stdcall myPresent(IDXGISwapChain *pSwapChain, UINT SyncInterval
 			ds = NULL;
 		}
 		if (! ds) {
-			ods("DXGI11: New state");
+			ods("DXGI11: New state for device %p", pDevice);
 			ds = new D11State(pSwapChain, pDevice);
 			chains[pSwapChain] = ds;
 			devices[pDevice] = ds;
@@ -519,6 +522,7 @@ static HRESULT __stdcall myPresent(IDXGISwapChain *pSwapChain, UINT SyncInterval
 		}
 
 		ds->draw();
+		ods("D3D11: myPresent release pDevice %p", pDevice);
 		pDevice->Release();
 	}
 
@@ -553,10 +557,13 @@ static ULONG __stdcall myAddRef(ID3D11Device *pDevice) {
 	LONG res = oAddRef(pDevice);
 	hhAddRef.inject();
 
-	Mutex m;
+	ods("D3D11: myAddRef %p res=%d", pDevice, res);
+
 	D11State *ds = devices[pDevice];
-	if (ds)
+	if (ds) {
+		ods("D3D11: HighMark %d->%d", ds->lHighMark, res);
 		ds->lHighMark = res;
+	}
 
 	return res;
 }
@@ -568,7 +575,8 @@ static ULONG __stdcall myRelease(ID3D11Device *pDevice) {
 	LONG res = oRelease(pDevice);
 	hhRelease.inject();
 
-	Mutex m;
+	ods("D3D11: myRelease %p res=%d", pDevice, res);
+
 	D11State *ds = devices[pDevice];
 	if (ds)
 		if (res < (ds->lHighMark / 2)) {
@@ -578,23 +586,26 @@ static ULONG __stdcall myRelease(ID3D11Device *pDevice) {
 			delete ds;
 			ods("D3D11: Deleted");
 			ds = NULL;
+		} else {
+			ods("D3D11: Keeping resources %d > .5 %d", res, ds->lHighMark);
 		}
 
 	return res;
 }
 
 static void HookAddRelease(voidFunc vfAdd, voidFunc vfRelease) {
-	ods("D3D11: Injecting device add/remove");
+	ods("D3D11: Injecting AddRef/Release");
 	hhAddRef.setup(vfAdd, reinterpret_cast<voidFunc>(myAddRef));
 	hhRelease.setup(vfRelease, reinterpret_cast<voidFunc>(myRelease));
 }
 
 static void HookPresentRaw(voidFunc vfPresent) {
+	ods("DXGI11: Injecting PresentRaw");
 	hhPresent.setup(vfPresent, reinterpret_cast<voidFunc>(myPresent));
 }
 
 static void HookResizeRaw(voidFunc vfResize) {
-	ods("DXGI11: Injecting ResizeBuffers Raw");
+	ods("DXGI11: Injecting ResizeBuffersRaw");
 	hhResize.setup(vfResize, reinterpret_cast<voidFunc>(myResize));
 }
 
@@ -626,13 +637,18 @@ void checkDXGI11Hook(bool preonly) {
 			GetModuleFileNameW(hDXGI, procname, 2048);
 			if (_wcsicmp(dxgi->wcDXGIFileName, procname) == 0) {
 				unsigned char *raw = (unsigned char *) hDXGI;
+
 				HookPresentRaw((voidFunc)(raw + dxgi->iOffsetPresent));
 				HookResizeRaw((voidFunc)(raw + dxgi->iOffsetResize));
 
-				GetModuleFileNameW(hD3D11, procname, 2048);
-				if (_wcsicmp(dxgi->wcD3D11FileName, procname) == 0) {
-					unsigned char *raw = (unsigned char *) hD3D11;
-					HookAddRelease((voidFunc)(raw + dxgi->iOffsetAddRef), (voidFunc)(raw + dxgi->iOffsetRelease));
+				if (dxgi->iOffsetAddRef && dxgi->iOffsetRelease) {
+					GetModuleFileNameW(hD3D11, procname, 2048);
+					if (_wcsicmp(dxgi->wcD3D11FileName, procname) == 0) {
+						unsigned char *raw = (unsigned char *) hD3D11;
+						HookAddRelease((voidFunc)(raw + dxgi->iOffsetAddRef), (voidFunc)(raw + dxgi->iOffsetRelease));
+					}
+				} else {
+					fods("DXGI11: Can't hook AddRef/Release");
 				}
 			} else if (! preonly) {
 				fods("DXGI11: DXGI Interface changed, can't rawpatch");
@@ -723,6 +739,7 @@ extern "C" __declspec(dllexport) void __cdecl PrepareDXGI11() {
 						HMODULE hRef;
 						void ***vtbl = (void ***) pSwapChain;
 						void *pPresent = (*vtbl)[8];
+
 						if (! GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (char *) pPresent, &hRef)) {
 							ods("DXGI11: Failed to get module for Present");
 						} else {
